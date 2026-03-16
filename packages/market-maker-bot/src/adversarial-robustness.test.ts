@@ -61,4 +61,26 @@ describe("adversarial robustness gates", () => {
     expect(result.regressions.length).toBeGreaterThan(0);
     expect(result.regressions[0]?.metric).toBe("mitigated.attackerPnl");
   });
+
+  it("flags scenarios where mitigation loses more than 10% vs baseline", () => {
+    const report = runAdversarialSuite(20260311);
+    const mutated = structuredClone(report);
+    const target = mutated.chains[0]!.scenarios[0]!;
+    const baseline = target.baseline.attackerPnl;
+    target.mitigated.attackerPnl = baseline * 1.11;
+
+    const strictLimits = {
+      ...DEFAULT_INVARIANT_LIMITS,
+      minLossReductionPct: -0.1,
+    };
+    const breaches = evaluateInvariantBreaches(mutated, strictLimits);
+    const lossReductionBreach = breaches.find(
+      (breach) =>
+        breach.chain === mutated.chains[0]!.chain &&
+        breach.scenario === target.scenario &&
+        breach.invariant === "lossReductionPct",
+    );
+
+    expect(lossReductionBreach).toBeDefined();
+  });
 });

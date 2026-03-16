@@ -20,6 +20,25 @@ type DoctorResult = {
 };
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const isWindows = process.platform === "win32";
+
+function buildToolPath(): string {
+  const userProfile = process.env.USERPROFILE ?? process.env.HOME ?? "";
+  const hints = [
+    process.env.PATH ?? "",
+    userProfile ? path.join(userProfile, ".cargo", "bin") : "",
+    userProfile ? path.join(userProfile, ".bun", "bin") : "",
+    userProfile
+      ? path.join(userProfile, ".local", "share", "solana", "install", "active_release", "bin")
+      : "",
+  ].filter(Boolean);
+  return hints.join(path.delimiter);
+}
+
+const toolEnv = {
+  ...process.env,
+  PATH: buildToolPath(),
+};
 
 function readRootPackageJson(): { packageManager?: string } {
   return JSON.parse(readFileSync(path.join(rootDir, "package.json"), "utf8")) as {
@@ -38,10 +57,17 @@ function readAnchorVersion(): string | undefined {
 }
 
 function commandExists(command: string): boolean {
-  const result = spawnSync("bash", ["-lc", `command -v ${command}`], {
-    cwd: rootDir,
-    encoding: "utf8",
-  });
+  const result = isWindows
+    ? spawnSync("where.exe", [command], {
+        cwd: rootDir,
+        encoding: "utf8",
+        env: toolEnv,
+      })
+    : spawnSync("bash", ["-lc", `command -v ${command}`], {
+        cwd: rootDir,
+        encoding: "utf8",
+        env: toolEnv,
+      });
   return result.status === 0;
 }
 
@@ -49,6 +75,7 @@ function runVersion(command: string, args: string[]): string | null {
   const result = spawnSync(command, args, {
     cwd: rootDir,
     encoding: "utf8",
+    env: toolEnv,
   });
   if (result.status !== 0) return null;
   return `${result.stdout}${result.stderr}`.trim();
@@ -58,6 +85,21 @@ function extractVersion(raw: string | null): string | null {
   if (!raw) return null;
   const match = raw.match(/(\d+\.\d+\.\d+)/);
   return match?.[1] ?? null;
+}
+
+function isVersionCompatible(
+  toolName: string,
+  expectedVersion: string,
+  installedVersion: string | null,
+): boolean {
+  if (!installedVersion) return false;
+  if (expectedVersion === installedVersion) return true;
+  if (toolName !== "bun") return false;
+
+  const expectedParts = expectedVersion.split(".");
+  const installedParts = installedVersion.split(".");
+  if (expectedParts.length < 2 || installedParts.length < 2) return false;
+  return expectedParts[0] === installedParts[0] && expectedParts[1] === installedParts[1];
 }
 
 function nodeModulesPresent(): boolean {
@@ -135,7 +177,10 @@ export function runDoctor(): DoctorResult {
     }
 
     const installedVersion = extractVersion(runVersion(check.command, check.versionArgs));
-    if (check.expectedVersion && installedVersion !== check.expectedVersion) {
+    if (
+      check.expectedVersion &&
+      !isVersionCompatible(check.name, check.expectedVersion, installedVersion)
+    ) {
       versionMismatches.push(
         `${check.name}: expected ${check.expectedVersion}, found ${installedVersion ?? "unknown"}`,
       );

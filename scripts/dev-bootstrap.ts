@@ -45,11 +45,8 @@ if (process.platform === "win32") {
   const nestedInstalls = [
     "packages/hyperbet-solana/anchor",
     "packages/hyperbet-solana/app",
-    "packages/hyperbet-solana/keeper",
     "packages/hyperbet-bsc/app",
-    "packages/hyperbet-bsc/keeper",
     "packages/hyperbet-avax/app",
-    "packages/hyperbet-avax/keeper",
   ];
   for (const cwd of nestedInstalls) {
     run("bun", ["install"], path.join(rootDir, cwd));

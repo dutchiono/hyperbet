@@ -38,7 +38,8 @@ function readAnchorVersion(): string | undefined {
 }
 
 function commandExists(command: string): boolean {
-  const result = spawnSync("bash", ["-lc", `command -v ${command}`], {
+  const locator = process.platform === "win32" ? "where" : "which";
+  const result = spawnSync(locator, [command], {
     cwd: rootDir,
     encoding: "utf8",
   });

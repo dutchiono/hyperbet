@@ -61,6 +61,11 @@ let agent2Hp = 30;
 let evmLifecycleStatus = "OPEN";
 let solanaLifecycleStatus = "OPEN";
 let activePredictionChains = ["bsc", "base", "avax", "solana"];
+type LifecycleTestChain = "bsc" | "base" | "avax" | "solana";
+let lifecycleMetadataByChain: Partial<
+  Record<LifecycleTestChain, Record<string, unknown> | null>
+> = {};
+let lifecycleSyncedAtLagMsByChain: Partial<Record<LifecycleTestChain, number>> = {};
 
 function resetSolanaState() {
   solanaState.marketExists = true;
@@ -510,6 +515,8 @@ describe("CrossChainMarketMaker", () => {
     evmLifecycleStatus = "OPEN";
     solanaLifecycleStatus = "OPEN";
     activePredictionChains = ["bsc", "base", "avax", "solana"];
+    lifecycleMetadataByChain = {};
+    lifecycleSyncedAtLagMsByChain = {};
 
     process.env.MM_ENV = "testnet";
     process.env.EVM_PRIVATE_KEY =
@@ -550,6 +557,8 @@ describe("CrossChainMarketMaker", () => {
             duelKey: TEST_DUEL_KEY,
             marketRef: "0xmarket",
             lifecycleStatus: evmLifecycleStatus,
+            syncedAt: Date.now() - (lifecycleSyncedAtLagMsByChain.bsc ?? 0),
+            metadata: lifecycleMetadataByChain.bsc ?? undefined,
           });
         }
         if (activePredictionChains.includes("base")) {
@@ -558,6 +567,8 @@ describe("CrossChainMarketMaker", () => {
             duelKey: TEST_DUEL_KEY,
             marketRef: "0xmarket",
             lifecycleStatus: evmLifecycleStatus,
+            syncedAt: Date.now() - (lifecycleSyncedAtLagMsByChain.base ?? 0),
+            metadata: lifecycleMetadataByChain.base ?? undefined,
           });
         }
         if (activePredictionChains.includes("avax")) {
@@ -566,6 +577,8 @@ describe("CrossChainMarketMaker", () => {
             duelKey: TEST_DUEL_KEY,
             marketRef: "0xmarket",
             lifecycleStatus: evmLifecycleStatus,
+            syncedAt: Date.now() - (lifecycleSyncedAtLagMsByChain.avax ?? 0),
+            metadata: lifecycleMetadataByChain.avax ?? undefined,
           });
         }
         if (activePredictionChains.includes("solana")) {
@@ -575,6 +588,8 @@ describe("CrossChainMarketMaker", () => {
             marketRef: null,
             lifecycleStatus: solanaLifecycleStatus,
             programId: TEST_SOLANA_PROGRAM_ID,
+            syncedAt: Date.now() - (lifecycleSyncedAtLagMsByChain.solana ?? 0),
+            metadata: lifecycleMetadataByChain.solana ?? undefined,
           });
         }
 
@@ -632,6 +647,25 @@ describe("CrossChainMarketMaker", () => {
     expect(mm.getActiveOrders()).toHaveLength(initialOrderCount);
     expect(contractInstances.every((instance) => instance.cancelOrder.mock.calls.length === 0)).toBe(true);
     expect(contractInstances.every((instance) => instance.placeOrder.mock.calls.length === 2)).toBe(true);
+  });
+
+  it("cancels EVM quotes when finality sync data is stale", async () => {
+    process.env.MM_ENABLE_SOLANA = "false";
+    process.env.MM_ENABLE_BASE = "false";
+    process.env.MM_ENABLE_AVAX = "false";
+    process.env.MM_FINALITY_MAX_SYNC_AGE_MS_BSC = "1000";
+    activePredictionChains = ["bsc"];
+    const mm = await loadMarketMaker();
+
+    await mm.marketMakeCycle();
+    expect(mm.getActiveOrders().filter((order) => order.chainKey === "bsc")).toHaveLength(2);
+
+    lifecycleSyncedAtLagMsByChain.bsc = 10_000;
+    invalidateBotCaches(mm);
+    await mm.marketMakeCycle();
+
+    expect(mm.getActiveOrders().filter((order) => order.chainKey === "bsc")).toHaveLength(0);
+    expect(contractInstances[0]?.cancelOrder.mock.calls.length).toBeGreaterThan(0);
   });
 
   it("treats proposed and challenged EVM markets as non-quotable", async () => {
@@ -711,6 +745,40 @@ describe("CrossChainMarketMaker", () => {
     expect(backlog[0]?.status).toBe("PENDING");
     expect(backlog[0]?.resolvedAt).toBeNull();
     expect(backlog[0]?.lastError).toContain("claim-not-ready");
+  });
+
+  it("defers EVM claim backlog while challenge window is still open", async () => {
+    process.env.MM_ENABLE_SOLANA = "false";
+    process.env.MM_ENABLE_BASE = "false";
+    process.env.MM_ENABLE_AVAX = "false";
+    activePredictionChains = ["bsc"];
+    evmLifecycleStatus = "RESOLVED";
+    lifecycleMetadataByChain.bsc = {
+      challengeWindowEndsAt: Date.now() + 120_000,
+      finalityDepthBlocks: 16,
+      reorgExposureWindowBlocks: 0,
+    };
+    const { createTestMarketMakerStateStore } = await import("./storage/index.ts");
+    const stateStore = createTestMarketMakerStateStore();
+    await stateStore.upsertClaimBacklog({
+      backlogKey: "claim-bsc-finality",
+      chainKey: "bsc",
+      duelKey: TEST_DUEL_KEY,
+      marketKey: "0xmarket",
+      status: "PENDING",
+      nextAttemptAt: 0,
+      payload: {},
+    });
+
+    const mm = await loadMarketMaker(stateStore);
+    await mm.marketMakeCycle();
+
+    const backlog = await stateStore.listDueClaimBacklog(Date.now() + 60_000);
+    const queued = backlog.find((entry) => entry.backlogKey === "claim-bsc-finality");
+    expect(queued).toBeDefined();
+    expect(queued?.status).toBe("PENDING");
+    expect(queued?.resolvedAt).toBeNull();
+    expect(queued?.lastError).toContain("finality-challenge-window-open");
   });
 
   it("re-reads the runtime nonce after a pre-broadcast EVM send failure", async () => {

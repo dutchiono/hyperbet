@@ -202,6 +202,21 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+function readLifecycleMetadataNumber(
+  record: PredictionMarketLifecycleRecord,
+  key: string,
+): number | null {
+  const metadata = record.metadata as Record<string, unknown> | undefined;
+  if (!metadata) return null;
+  const raw = metadata[key];
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 function normalizePredictionMarketDuelKeyHex(
   value: string | null | undefined,
 ): string | null {
@@ -298,6 +313,30 @@ const MM_MARKETS_CACHE_MS = Math.max(
   100,
   readEnvNumber("MM_MARKETS_CACHE_MS", 1000),
 );
+const MM_FINALITY_MIN_DEPTH_BLOCKS = {
+  solana: Math.max(1, readEnvNumber("MM_FINALITY_MIN_DEPTH_BLOCKS_SOLANA", 4)),
+  bsc: Math.max(1, readEnvNumber("MM_FINALITY_MIN_DEPTH_BLOCKS_BSC", 8)),
+  base: Math.max(1, readEnvNumber("MM_FINALITY_MIN_DEPTH_BLOCKS_BASE", 8)),
+  avax: Math.max(1, readEnvNumber("MM_FINALITY_MIN_DEPTH_BLOCKS_AVAX", 9)),
+} as const;
+const MM_FINALITY_MAX_REORG_EXPOSURE_BLOCKS = {
+  solana: Math.max(0, readEnvNumber("MM_FINALITY_MAX_REORG_EXPOSURE_BLOCKS_SOLANA", 2)),
+  bsc: Math.max(0, readEnvNumber("MM_FINALITY_MAX_REORG_EXPOSURE_BLOCKS_BSC", 3)),
+  base: Math.max(0, readEnvNumber("MM_FINALITY_MAX_REORG_EXPOSURE_BLOCKS_BASE", 3)),
+  avax: Math.max(0, readEnvNumber("MM_FINALITY_MAX_REORG_EXPOSURE_BLOCKS_AVAX", 4)),
+} as const;
+const MM_FINALITY_MAX_SYNC_AGE_MS = {
+  solana: Math.max(1_000, readEnvNumber("MM_FINALITY_MAX_SYNC_AGE_MS_SOLANA", 25_000)),
+  bsc: Math.max(1_000, readEnvNumber("MM_FINALITY_MAX_SYNC_AGE_MS_BSC", 45_000)),
+  base: Math.max(1_000, readEnvNumber("MM_FINALITY_MAX_SYNC_AGE_MS_BASE", 45_000)),
+  avax: Math.max(1_000, readEnvNumber("MM_FINALITY_MAX_SYNC_AGE_MS_AVAX", 50_000)),
+} as const;
+const MM_FINALITY_MIN_SETTLEMENT_AGE_MS = {
+  solana: Math.max(0, readEnvNumber("MM_FINALITY_MIN_SETTLEMENT_AGE_MS_SOLANA", 5_000)),
+  bsc: Math.max(0, readEnvNumber("MM_FINALITY_MIN_SETTLEMENT_AGE_MS_BSC", 15_000)),
+  base: Math.max(0, readEnvNumber("MM_FINALITY_MIN_SETTLEMENT_AGE_MS_BASE", 15_000)),
+  avax: Math.max(0, readEnvNumber("MM_FINALITY_MIN_SETTLEMENT_AGE_MS_AVAX", 20_000)),
+} as const;
 const SOLANA_RPC_BACKOFF_MS = Math.max(
   10_000,
   readEnvNumber("SOLANA_RPC_CHECK_COOLDOWN_MS", 60_000),
@@ -1131,6 +1170,70 @@ export class CrossChainMarketMaker {
     return `${chainKey}:${duelKey}:${marketKey}`;
   }
 
+  private finalityQuoteBlocked(
+    chainKey: BettingChainKey,
+    lifecycleRecord: PredictionMarketLifecycleRecord,
+    now: number,
+  ): string | null {
+    if (
+      lifecycleRecord.syncedAt != null &&
+      now - lifecycleRecord.syncedAt > MM_FINALITY_MAX_SYNC_AGE_MS[chainKey]
+    ) {
+      return "finality-sync-stale";
+    }
+
+    const reorgExposure = readLifecycleMetadataNumber(
+      lifecycleRecord,
+      "reorgExposureWindowBlocks",
+    );
+    if (
+      reorgExposure != null &&
+      reorgExposure > MM_FINALITY_MAX_REORG_EXPOSURE_BLOCKS[chainKey]
+    ) {
+      return "finality-reorg-exposure";
+    }
+
+    const finalityDepth = readLifecycleMetadataNumber(
+      lifecycleRecord,
+      "finalityDepthBlocks",
+    );
+    if (
+      finalityDepth != null &&
+      finalityDepth < MM_FINALITY_MIN_DEPTH_BLOCKS[chainKey]
+    ) {
+      return "finality-depth-too-shallow";
+    }
+
+    return null;
+  }
+
+  private finalityClaimBlocked(
+    chainKey: BettingChainKey,
+    lifecycleRecord: PredictionMarketLifecycleRecord,
+    now: number,
+  ): string | null {
+    const quoteRisk = this.finalityQuoteBlocked(chainKey, lifecycleRecord, now);
+    if (quoteRisk) return quoteRisk;
+
+    const challengeWindowEndsAt = readLifecycleMetadataNumber(
+      lifecycleRecord,
+      "challengeWindowEndsAt",
+    );
+    if (challengeWindowEndsAt != null && now < challengeWindowEndsAt) {
+      return "finality-challenge-window-open";
+    }
+
+    const finalizedAt = readLifecycleMetadataNumber(lifecycleRecord, "finalizedAt");
+    if (
+      finalizedAt != null &&
+      now < finalizedAt + MM_FINALITY_MIN_SETTLEMENT_AGE_MS[chainKey]
+    ) {
+      return "finality-settlement-age";
+    }
+
+    return null;
+  }
+
   private async enqueueClaimBacklogForMarket(
     chainKey: BettingChainKey,
     duelKey: string,
@@ -1440,6 +1543,24 @@ export class CrossChainMarketMaker {
     for (const item of items) {
       const attemptAt = Date.now();
       try {
+        const lifecycleRecord =
+          predictionMarkets?.markets.find((market) => market.chainKey === item.chainKey) ??
+          null;
+        if (
+          lifecycleRecord?.lifecycleStatus !== "RESOLVED" &&
+          lifecycleRecord?.lifecycleStatus !== "CANCELLED"
+        ) {
+          throw new Error("claim-not-ready");
+        }
+        const finalityBlock = this.finalityClaimBlocked(
+          item.chainKey,
+          lifecycleRecord,
+          attemptAt,
+        );
+        if (finalityBlock) {
+          throw new Error(finalityBlock);
+        }
+
         if (item.chainKey === "solana") {
           const runtime = this.solanaRuntime;
           if (!this.solanaEnabled || !runtime) {
@@ -1472,15 +1593,6 @@ export class CrossChainMarketMaker {
           );
           if (!runtime || !runtime.enabled) {
             throw new Error("evm-runtime-unavailable");
-          }
-          const lifecycleRecord =
-            predictionMarkets?.markets.find((market) => market.chainKey === item.chainKey) ??
-            null;
-          if (
-            lifecycleRecord?.lifecycleStatus !== "RESOLVED" &&
-            lifecycleRecord?.lifecycleStatus !== "CANCELLED"
-          ) {
-            throw new Error("claim-not-ready");
           }
           const { tx } = await this.sendEvmTransaction(runtime, (nonce) =>
             runtime.clob.claim(
@@ -1517,6 +1629,7 @@ export class CrossChainMarketMaker {
         }
         const nextAttemptAt =
           message.includes("claim-not-ready") ||
+          message.includes("finality-") ||
           message.includes("runtime-unavailable")
             ? attemptAt + 15_000
             : attemptAt + 30_000;
@@ -1616,6 +1729,22 @@ export class CrossChainMarketMaker {
     }
 
     const duelKey = lifecycleRecord.duelKey;
+    const finalityQuoteBlock = this.finalityQuoteBlocked(
+      runtime.chainKey,
+      lifecycleRecord,
+      Date.now(),
+    );
+    if (
+      finalityQuoteBlock &&
+      isPredictionMarketQuotableStatus(lifecycleRecord.lifecycleStatus)
+    ) {
+      await this.cancelOrdersForMarket(
+        runtime.chainKey,
+        duelKey,
+        finalityQuoteBlock,
+      );
+      return;
+    }
     const marketKey = String(
       lifecycleRecord.marketRef ||
         (await runtime.clob.marketKey(duelKey, EVM_MARKET_KIND_DUEL_WINNER)),
@@ -2416,6 +2545,14 @@ export class CrossChainMarketMaker {
     }
 
     const duelKey = lifecycleRecord.duelKey;
+    const finalityQuoteBlock = this.finalityQuoteBlocked("solana", lifecycleRecord, now);
+    if (
+      finalityQuoteBlock &&
+      isPredictionMarketQuotableStatus(lifecycleRecord.lifecycleStatus)
+    ) {
+      await this.cancelSolanaOrdersForMarket(duelKey, finalityQuoteBlock);
+      return;
+    }
     const duelState = findDuelStatePda(
       runtime.fightOracleProgramId,
       duelKeyHexToBytes(duelKey),
@@ -2456,13 +2593,20 @@ export class CrossChainMarketMaker {
           marketStatePda.toBase58(),
           { source: "lifecycle-transition" },
         );
-        await this.claimSolanaMarket(
-          duelKey,
-          duelState,
-          marketStatePda,
-          userBalancePda,
-          vaultPda,
+        const finalityClaimBlock = this.finalityClaimBlocked(
+          "solana",
+          lifecycleRecord,
+          now,
         );
+        if (!finalityClaimBlock) {
+          await this.claimSolanaMarket(
+            duelKey,
+            duelState,
+            marketStatePda,
+            userBalancePda,
+            vaultPda,
+          );
+        }
       }
       return;
     }

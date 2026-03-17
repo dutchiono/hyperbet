@@ -183,7 +183,12 @@ export const SCENARIO_RISK_BUDGETS: Record<ScenarioId, ScenarioRiskBudget> = {
     },
   ),
   reorg_finality_lag: baseScenarioBudget(
-    ["settlement.required_commitment", "stale_halt.active"],
+    [
+      "settlement.required_commitment",
+      "settlement.min_finality_depth_blocks",
+      "settlement.max_reorg_exposure_window_blocks",
+      "stale_halt.active",
+    ],
     {
       maxMitigatedAttackerPnl: 24,
       maxExploitEvents: 18,

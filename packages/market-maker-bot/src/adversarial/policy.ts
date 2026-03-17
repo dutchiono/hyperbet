@@ -11,6 +11,8 @@ export type ChainPolicy = {
   minDisputeLivenessSeconds: number;
   requiredSettlementCommitment: CommitmentLevel;
   allowUnfinalizedQueries: boolean;
+  minFinalityDepthBlocks: number;
+  maxReorgExposureWindowBlocks: number;
 };
 
 export type PolicyBreach = {
@@ -21,6 +23,8 @@ export type PolicyBreach = {
     | "oracle.max_same_slot_round_trips"
     | "settlement.required_commitment"
     | "settlement.allow_unfinalized_queries"
+    | "settlement.min_finality_depth_blocks"
+    | "settlement.max_reorg_exposure_window_blocks"
     | "resolution.min_dispute_liveness_seconds";
   expected: string;
   actual: string | number;
@@ -41,6 +45,8 @@ export const DEFAULT_CHAIN_POLICIES: Record<ChainId, ChainPolicy> = {
     minDisputeLivenessSeconds: 450,
     requiredSettlementCommitment: "finalized",
     allowUnfinalizedQueries: false,
+    minFinalityDepthBlocks: 4,
+    maxReorgExposureWindowBlocks: 2,
   },
   bsc: {
     chain: "bsc",
@@ -50,6 +56,8 @@ export const DEFAULT_CHAIN_POLICIES: Record<ChainId, ChainPolicy> = {
     minDisputeLivenessSeconds: 600,
     requiredSettlementCommitment: "finalized",
     allowUnfinalizedQueries: false,
+    minFinalityDepthBlocks: 8,
+    maxReorgExposureWindowBlocks: 3,
   },
   avax: {
     chain: "avax",
@@ -59,6 +67,8 @@ export const DEFAULT_CHAIN_POLICIES: Record<ChainId, ChainPolicy> = {
     minDisputeLivenessSeconds: 600,
     requiredSettlementCommitment: "finalized",
     allowUnfinalizedQueries: false,
+    minFinalityDepthBlocks: 9,
+    maxReorgExposureWindowBlocks: 4,
   },
 };
 
@@ -127,6 +137,38 @@ function inferDisputeLivenessSeconds(chain: ChainProfile, liquidationRun: Scenar
   );
 }
 
+function inferFinalityDepthBlocks(
+  chain: ChainProfile,
+  gasRun: ScenarioRun,
+  reorgRun: ScenarioRun,
+): number {
+  return Math.max(
+    1,
+    Math.round(
+      chain.settlementLagTicks * 2 +
+        chain.mevRisk * 4 +
+        gasRun.mitigated.exploitEvents * 0.2 +
+        reorgRun.mitigated.exploitEvents * 0.35,
+    ),
+  );
+}
+
+function inferReorgExposureWindowBlocks(
+  chain: ChainProfile,
+  reorgRun: ScenarioRun,
+  gasRun: ScenarioRun,
+): number {
+  return Math.max(
+    0,
+    Math.round(
+      reorgRun.mitigated.exploitEvents * (1.8 + chain.mevRisk * 0.6) +
+        reorgRun.mitigated.toxicFillRate * 20 +
+        reorgRun.mitigated.avgAdverseSlippageBps * 0.08 +
+        gasRun.mitigated.toxicFillRate * (2 + chain.mempoolFriction),
+    ),
+  );
+}
+
 export function evaluatePolicyBreaches(
   report: SuiteReport,
   policies: Record<ChainId, ChainPolicy> = DEFAULT_CHAIN_POLICIES,
@@ -139,6 +181,7 @@ export function evaluatePolicyBreaches(
     const profile = chainProfile(chain);
     const staleRun = scenarioById(chainReport.scenarios, "stale_signal_arbitrage");
     const gasRun = scenarioById(chainReport.scenarios, "gas_auction_backrun");
+    const reorgRun = scenarioById(chainReport.scenarios, "reorg_finality_lag");
     const liquidationRun = scenarioById(chainReport.scenarios, "liquidation_cascade");
 
     const oracleAgeSeconds = inferOracleAgeSeconds(profile, staleRun);
@@ -195,6 +238,30 @@ export function evaluatePolicyBreaches(
         control: "settlement.allow_unfinalized_queries",
         expected: "false",
         actual: "true",
+      });
+    }
+
+    const finalityDepthBlocks = inferFinalityDepthBlocks(profile, gasRun, reorgRun);
+    if (finalityDepthBlocks < policy.minFinalityDepthBlocks) {
+      breaches.push({
+        chain,
+        control: "settlement.min_finality_depth_blocks",
+        expected: `>= ${policy.minFinalityDepthBlocks}`,
+        actual: finalityDepthBlocks,
+      });
+    }
+
+    const reorgExposureWindow = inferReorgExposureWindowBlocks(
+      profile,
+      reorgRun,
+      gasRun,
+    );
+    if (reorgExposureWindow > policy.maxReorgExposureWindowBlocks) {
+      breaches.push({
+        chain,
+        control: "settlement.max_reorg_exposure_window_blocks",
+        expected: `<= ${policy.maxReorgExposureWindowBlocks}`,
+        actual: reorgExposureWindow,
       });
     }
 
